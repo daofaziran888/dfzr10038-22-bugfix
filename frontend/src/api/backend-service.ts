@@ -1,6 +1,13 @@
 import { request } from './client'
 import { moduleMeta } from '@/data/modules'
-import type { ActionResult, EntryRow, OverviewResult, PageResult } from '@/data/types'
+import type {
+  ActionResult,
+  EntryRow,
+  FlowTraceResult,
+  OverviewResult,
+  PageResult,
+  ReconcileResult,
+} from '@/data/types'
 
 export { moduleMeta }
 
@@ -57,5 +64,40 @@ export async function downloadEntries(
 export async function loadOverview(): Promise<OverviewResult> {
   const response = await request('/api/overview')
   if (!response.ok) throw new Error('运营概览读取失败')
+  return await response.json()
+}
+
+export async function loadFlowTrace(key: string, id: number): Promise<FlowTraceResult> {
+  const response = await request(`/api/${key}/${id}/flow-trace`)
+  if (!response.ok) throw new Error('联动轨迹读取失败')
+  return await response.json()
+}
+
+export async function loadReconcile(key: string): Promise<ReconcileResult> {
+  const response = await request(`/api/${key}/reconcile`)
+  if (!response.ok) throw new Error('管道对账表读取失败')
+  return await response.json()
+}
+
+export async function settleBatch(
+  key: string,
+  values: Record<string, string>,
+): Promise<ActionResult> {
+  const response = await request(`/api/${key}/reconcile/settle`, {
+    method: 'POST',
+    body: JSON.stringify(values),
+  })
+  return await response.json()
+}
+
+export async function registerReceipt(
+  key: string,
+  id: number,
+  actionId?: string,
+): Promise<ActionResult> {
+  const response = await request(`/api/${key}/${id}/receipts`, {
+    method: 'POST',
+    body: JSON.stringify(actionId ? { 动作编号: actionId } : {}),
+  })
   return await response.json()
 }

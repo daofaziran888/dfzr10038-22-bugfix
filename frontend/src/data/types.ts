@@ -30,6 +30,60 @@ export type PageResult = {
 export type ActionResult = {
   ok: boolean
   message: string
+  entry?: Record<string, unknown> | null
+  flow?: Record<string, unknown> | null
+}
+
+export type FlowEffectItem = {
+  action_id: string
+  name: string
+  module: string
+  entry_id: number
+  description: string
+  timestamp: string
+  batch: string | null
+  origin_module: string
+  origin_id: number
+  origin_action: string
+}
+
+export type FlowTraceResult = {
+  module: string
+  entry_id: number
+  action_ids: string[]
+  effects: FlowEffectItem[]
+}
+
+export type ReconcileGap = {
+  存储配置: string
+  存储配置ID: number
+  状态: string
+  缺口原因: string
+}
+
+export type ReconcileRow = {
+  批次: string
+  动作编号: string
+  管道编号: string
+  管道ID: number
+  存储配置: string
+  存储配置ID: number | null
+  接受时间: string
+  管道状态: string
+  回执状态: string
+  回执编号: string | null
+  回执时间: string | null
+  交付核查: string
+  结算状态: string
+  结算结果: string | null
+  结算时间: string | null
+}
+
+export type ReconcileResult = {
+  module: string
+  items: ReconcileRow[]
+  total: number
+  gaps: ReconcileGap[]
 }
 
 export type OverviewResult = {

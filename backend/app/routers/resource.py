@@ -5,12 +5,12 @@ import csv
 import io
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Body, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services import service_for
-from app.services.data_flow import FlowEffect, FLOW_TRIGGERS, flow_engine
+from app.services.data_flow import flow_engine
 
 router = APIRouter(prefix="/api", tags=["业务资源"])
 
@@ -74,6 +74,36 @@ def export_entries(
     )
 
 
+@router.get("/{module}/reconcile")
+def reconcile_entries(module: str) -> dict[str, Any]:
+    """离线导出管道对账表：接受凭据 × 存储回执 × 交接结算（只读）。
+
+    必须注册在 /{module}/{entry_id} 之前，否则 reconcile 会被当成 entry_id。
+    """
+    require_service(module)
+    if module != "offline_exp":
+        raise HTTPException(status_code=404, detail="管道对账仅适用于离线导出模块")
+    table = flow_engine.reconcile_exports()
+    return {"module": module, **table}
+
+
+@router.post("/{module}/reconcile/settle", response_model=ActionResult)
+def settle_handover(
+    module: str, payload: dict[str, Any] = Body(default_factory=dict)
+) -> ActionResult:
+    """值班员提交本班导出批次的交接结算；同批最终只结算一次。"""
+    require_service(module)
+    if module != "offline_exp":
+        raise HTTPException(status_code=404, detail="交接结算仅适用于离线导出模块")
+    record, message = flow_engine.settle_handover(
+        action_id=payload.get("动作编号") or payload.get("action_id"),
+        batch=payload.get("批次") or payload.get("batch"),
+        operator=payload.get("值班员") or payload.get("operator"),
+        shift=payload.get("班次") or payload.get("shift"),
+    )
+    return ActionResult(ok=record is not None, message=message, entry=record)
+
+
 @router.get("/{module}/{entry_id}", response_model=dict)
 def get_entry(module: str, entry_id: int) -> dict[str, Any]:
     service = require_service(module)
@@ -94,17 +124,24 @@ def create_entry(module: str, payload: EntryPayload) -> ActionResult:
 
 @router.get("/{module}/{entry_id}/flow-trace")
 def get_flow_trace(module: str, entry_id: int):
-    """查看某个 entry 参与的跨模块数据流副作用。"""
+    """查看某个 entry 参与的跨模块数据流副作用。
+
+    只读接口：回传动作轨迹日志里已记录的事实，
+    不会再次认领作业，也不会推动任何新管道进入运行中。
+    """
     require_service(module)
-    effects: list[dict] = []
-    for key, triggers in FLOW_TRIGGERS.items():
-        if key.startswith(f"{module}/"):
-            for fn in triggers:
-                eff = fn(entry_id)
-                effects.extend([{"name": e.name, "module": e.module, "entry_id": e.entry_id,
-                                 "description": e.description, "timestamp": e.timestamp}
-                                for e in eff])
-    return {"module": module, "entry_id": entry_id, "effects": effects}
+    return flow_engine.trace(module, entry_id)
+
+
+@router.post("/{module}/{entry_id}/receipts", response_model=ActionResult)
+def register_receipt(
+    module: str, entry_id: int, payload: dict[str, Any] = Body(default_factory=dict)
+) -> ActionResult:
+    """登记存储回执（存储动作的第二次写入）；同一动作不重复登记。"""
+    require_service(module)
+    receipt, message = flow_engine.register_receipt(
+        module, entry_id, action_id=payload.get("动作编号") or payload.get("action_id"))
+    return ActionResult(ok=receipt is not None, message=message, entry=receipt)
 
 
 @router.post("/{module}/{entry_id}/actions", response_model=ActionResult)

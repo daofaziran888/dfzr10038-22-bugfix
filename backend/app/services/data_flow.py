@@ -2,12 +2,17 @@
 
 每条链路封装为 FlowStep，由 FlowEngine 按序执行并收集副作用。
 不做独立CRUD，只在业务动作完成后触发下游消费逻辑。
+
+写路径（on_action / replay_link）执行链路并把副作用记入动作轨迹日志；
+读路径（trace / reconcile_exports）只回传已记录的事实，绝不再触发链路，
+保证查询不会推动任何新管道进入运行中。
 """
 from __future__ import annotations
 
 import datetime
 import math
 import random
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -26,6 +31,22 @@ class FlowEffect:
     entry_id: int
     description: str
     timestamp: str = field(default_factory=lambda: datetime.datetime.now().isoformat())
+    # 离线导出管道接受时签发的批次号；非接受类副作用为 None
+    batch: str | None = None
+
+
+@dataclass
+class FlowContext:
+    """一次业务动作派发的上下文：动作编号贯穿整条链路，批次号按需签发。"""
+    action_id: str
+    module: str
+    action: str
+    entry_id: int
+    engine: "FlowEngine"
+
+    def next_batch(self) -> str:
+        """为本次动作签发下一个导出批次号。"""
+        return self.engine._next_batch()
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +71,7 @@ def _register(path: str, *, desc: str):
     "feature_reg/审核注册 → derive_rule/启效规则 → time_window/启动计算",
     desc="特征注册后自动触发对应衍生规则生效、时间窗口模板计算",
 )
-def flow_reg_to_derive_to_window(feature_reg_id: int) -> list[FlowEffect]:
+def flow_reg_to_derive_to_window(feature_reg_id: int, ctx: FlowContext | None = None) -> list[FlowEffect]:
     effects: list[FlowEffect] = []
     feature_reg_entry = store.find("feature_reg", feature_reg_id)
     if feature_reg_entry is None or feature_reg_entry.get("status") != "已注册":
@@ -101,7 +122,7 @@ def _window_compute_for_derived(
     "time_window/窗口关闭 → backfill_job/启动回溯 → feature_store/启用存储 → feature_mon/启用监控",
     desc="窗口关闭后发起特征回溯，回溯完成写入存储并启用监控。",
 )
-def flow_window_to_backfill_to_store_mon(time_window_id: int) -> list[FlowEffect]:
+def flow_window_to_backfill_to_store_mon(time_window_id: int, ctx: FlowContext | None = None) -> list[FlowEffect]:
     effects: list[FlowEffect] = []
     win = store.find("time_window", time_window_id)
     if win is None or win.get("status") != "窗口关闭":
@@ -186,7 +207,7 @@ def _backfill_done_store_mon(backfill_row: dict[str, Any], effects: list[FlowEff
     "feature_store/启用存储 → online_serv/部署服务 → offline_exp/启动导出",
     desc="特征存储启用后同步部署在线服务和触发离线导出管道。",
 )
-def flow_store_to_online_offline(feature_store_id: int) -> list[FlowEffect]:
+def flow_store_to_online_offline(feature_store_id: int, ctx: FlowContext | None = None) -> list[FlowEffect]:
     effects: list[FlowEffect] = []
     fs = store.find("feature_store", feature_store_id)
     if fs is None or fs.get("status") != "已启用":
@@ -209,17 +230,30 @@ def flow_store_to_online_offline(feature_store_id: int) -> list[FlowEffect]:
             ))
             break
 
-    # 触发离线导出
+    # 触发离线导出：管道接受是本次存储动作的第一次写入，
+    # 在接受的管道上留下带动作编号和批次的接受凭据；
+    # 第二次写入（存储回执登记）由回执到达时独立完成。
     offline_rows = store.rows("offline_exp")
     for erow in offline_rows:
         if erow.get("status") == "待执行":
+            accepted_at = datetime.datetime.now().isoformat()
             erow["status"] = "导出中"
             erow["pending"] = True
-            erow["最后导出"] = datetime.datetime.now().isoformat()
+            erow["最后导出"] = accepted_at
             erow["triggered_by"] = f"feature_store/{config_no}"
+            batch_no = None
+            if ctx is not None:
+                batch_no = ctx.next_batch()
+                erow["接受凭据"] = {
+                    "动作编号": ctx.action_id,
+                    "批次": batch_no,
+                    "存储配置": config_no,
+                    "接受时间": accepted_at,
+                }
             effects.append(FlowEffect(
                 "启动导出", "offline_exp", int(erow.get("id", 0)),
                 f"存储 {config_no} 启用后联动离线导出管道 {erow.get('管道编号','')}",
+                batch=batch_no,
             ))
             break
 
@@ -233,7 +267,7 @@ def flow_store_to_online_offline(feature_store_id: int) -> list[FlowEffect]:
     "derive_rule/启效规则 → feature_line/确认链路",
     desc="衍生规则生效后自动推导并确认特征血缘链路。",
 )
-def flow_derive_to_lineage(derive_rule_id: int) -> list[FlowEffect]:
+def flow_derive_to_lineage(derive_rule_id: int, ctx: FlowContext | None = None) -> list[FlowEffect]:
     effects: list[FlowEffect] = []
     dr = store.find("derive_rule", derive_rule_id)
     if dr is None or dr.get("status") != "生效中":
@@ -272,7 +306,7 @@ def flow_derive_to_lineage(derive_rule_id: int) -> list[FlowEffect]:
     "feature_line/确认链路 → version_mgr/灰度发布 → feature_mon/启用监控",
     desc="血缘确认后触发版本灰度发布，并关联启用特征监控规则。",
 )
-def flow_lineage_to_version_to_mon(feature_line_id: int) -> list[FlowEffect]:
+def flow_lineage_to_version_to_mon(feature_line_id: int, ctx: FlowContext | None = None) -> list[FlowEffect]:
     effects: list[FlowEffect] = []
     fl = store.find("feature_line", feature_line_id)
     if fl is None or fl.get("status") != "已确认":
@@ -320,7 +354,7 @@ def flow_lineage_to_version_to_mon(feature_line_id: int) -> list[FlowEffect]:
     "version_mgr/全量切换 → online_serv/部署服务(热加载)",
     desc="版本全量切换后触发在线服务热加载，更新服务端点特征列表。",
 )
-def flow_version_to_online(version_mgr_id: int) -> list[FlowEffect]:
+def flow_version_to_online(version_mgr_id: int, ctx: FlowContext | None = None) -> list[FlowEffect]:
     effects: list[FlowEffect] = []
     vm = store.find("version_mgr", version_mgr_id)
     if vm is None or vm.get("status") != "全量生效":
@@ -373,7 +407,7 @@ def flow_version_to_online(version_mgr_id: int) -> list[FlowEffect]:
     "sample_strata/已出样 → label_task/派发任务 → label_review/确认通过 → consent_calc/启动计算",
     desc="样本确认出样后派发标注任务，审核通过后自动触发一致性计算。",
 )
-def flow_sample_to_label_to_review_to_consent(sample_strata_id: int) -> list[FlowEffect]:
+def flow_sample_to_label_to_review_to_consent(sample_strata_id: int, ctx: FlowContext | None = None) -> list[FlowEffect]:
     effects: list[FlowEffect] = []
     ss = store.find("sample_strata", sample_strata_id)
     if ss is None or ss.get("status") != "已出样":
@@ -468,7 +502,7 @@ def _consent_calc_trigger(label_task: dict[str, Any], effects: list[FlowEffect])
     "feat_catalog/发布目录 → govern_audit/发起审计 → report_task/启动生成",
     desc="特征目录发布后触发治理审计，审计完成后生成特征报告。",
 )
-def flow_catalog_to_audit_to_report(feat_catalog_id: int) -> list[FlowEffect]:
+def flow_catalog_to_audit_to_report(feat_catalog_id: int, ctx: FlowContext | None = None) -> list[FlowEffect]:
     effects: list[FlowEffect] = []
     fc = store.find("feat_catalog", feat_catalog_id)
     if fc is None or fc.get("status") != "已发布":
@@ -530,7 +564,7 @@ def _report_generate(catalog_name: str, index_no: str, effects: list[FlowEffect]
     "quality_rule/确认阻断 → feature_mon/确认漂移 → report_task/启动生成",
     desc="质量规则阻断后联动特征监控漂移告警并生成异常报告。",
 )
-def flow_quality_to_mon_to_report(quality_rule_id: int) -> list[FlowEffect]:
+def flow_quality_to_mon_to_report(quality_rule_id: int, ctx: FlowContext | None = None) -> list[FlowEffect]:
     effects: list[FlowEffect] = []
     qr = store.find("quality_rule", quality_rule_id)
     if qr is None or qr.get("status") != "已阻断":
@@ -579,7 +613,7 @@ def flow_quality_to_mon_to_report(quality_rule_id: int) -> list[FlowEffect]:
     "schedule_job/激活计划 → batch_load/启动接入 → backfill_job/启动回溯",
     desc="调度计划激活后按编排顺序触发批量接入和特征回溯。",
 )
-def flow_schedule_to_batch_to_backfill(schedule_job_id: int) -> list[FlowEffect]:
+def flow_schedule_to_batch_to_backfill(schedule_job_id: int, ctx: FlowContext | None = None) -> list[FlowEffect]:
     effects: list[FlowEffect] = []
 
     sj = store.find("schedule_job", schedule_job_id)
@@ -646,15 +680,61 @@ for link in FLOW_LINKS:
 
 
 class FlowEngine:
-    """跨模块数据流编排引擎。"""
+    """跨模块数据流编排引擎。
+
+    写路径（on_action / replay_link）执行链路并把副作用记入动作轨迹日志；
+    读路径（trace / reconcile_exports）只回传已记录的事实，
+    读取与派工并发时查询不会推动任何新管道进入运行中。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._action_seq = 0
+        self._batch_seq = 0
+        self._receipt_seq = 0
+        # 动作轨迹：已完成的联动事件日志（读路径唯一事实来源）
+        self._events: list[dict[str, Any]] = []
+        # 存储回执：动作编号 -> 回执（存储动作的第二次写入，可能迟到）
+        self._receipts: dict[str, dict[str, Any]] = {}
+        # 交接结算：批次 -> 结算记录（同批最终只结算一次）
+        self._settlements: dict[str, dict[str, Any]] = {}
+
+    # ------------------------------------------------------------------
+    # 编号签发
+    # ------------------------------------------------------------------
+
+    def _next_action_id(self) -> str:
+        with self._lock:
+            self._action_seq += 1
+            return f"ACT-{self._action_seq:04d}"
+
+    def _next_batch(self) -> str:
+        with self._lock:
+            self._batch_seq += 1
+            return f"BATCH-{self._batch_seq:04d}"
+
+    def _next_receipt_no(self) -> str:
+        with self._lock:
+            self._receipt_seq += 1
+            return f"RCPT-{self._receipt_seq:04d}"
+
+    # ------------------------------------------------------------------
+    # 写路径：动作派发（唯一允许触发链路的入口）
+    # ------------------------------------------------------------------
 
     def on_action(self, module: str, action: str, entry_id: int) -> dict[str, Any]:
-        """在业务动作路由执行后调用，触发下游链路消费。
+        """在业务动作路由执行后调用，触发下游链路消费并记录动作轨迹。
 
         Returns:
-            {"chains": [...链名称], "effects": [...副作用记录], "hits": N}
+            {"action_id": 动作编号, "chains": [...链名称],
+             "effects": [...副作用记录], "hits": N}
         """
         triggers = FLOW_TRIGGERS.get(f"{module}/{action}", [])
+        if not triggers:
+            return {"action_id": None, "chains": [], "effects": [], "hits": 0}
+
+        ctx = FlowContext(action_id=self._next_action_id(), module=module,
+                          action=action, entry_id=entry_id, engine=self)
         all_effects: list[FlowEffect] = []
         chain_hits: list[str] = []
 
@@ -664,26 +744,266 @@ class FlowEngine:
                 if link["trigger"] is trigger_fn and not found:
                     chain_hits.append(str(link["desc"]))
                     found = True
-            effects = trigger_fn(entry_id)
+            effects = trigger_fn(entry_id, ctx)
             all_effects.extend(effects)
 
+        self._journal(ctx, all_effects)
+
         return {
+            "action_id": ctx.action_id,
             "chains": chain_hits,
-            "effects": [
-                {"name": e.name, "module": e.module, "entry_id": e.entry_id,
-                 "description": e.description, "timestamp": e.timestamp}
-                for e in all_effects
-            ],
+            "effects": [self._effect_payload(e) for e in all_effects],
             "hits": len(all_effects),
         }
 
     def replay_link(self, path_key: str, entry_id: int) -> list[FlowEffect]:
-        """手动重放指定链路。path_key 如 "derive_rule/启效规则"."""
+        """手动重放指定链路。path_key 如 "derive_rule/启效规则"。"""
         triggers = FLOW_TRIGGERS.get(path_key, [])
+        module, _, action = path_key.partition("/")
+        ctx = FlowContext(action_id=self._next_action_id(), module=module,
+                          action=action, entry_id=entry_id, engine=self)
         effects: list[FlowEffect] = []
         for fn in triggers:
-            effects.extend(fn(entry_id))
+            effects.extend(fn(entry_id, ctx))
+        self._journal(ctx, effects)
         return effects
+
+    def _journal(self, ctx: FlowContext, effects: list[FlowEffect]) -> None:
+        """把一次动作产生的副作用写入动作轨迹日志。"""
+        with self._lock:
+            for effect in effects:
+                self._events.append({
+                    "action_id": ctx.action_id,
+                    "name": effect.name,
+                    "module": effect.module,
+                    "entry_id": effect.entry_id,
+                    "description": effect.description,
+                    "timestamp": effect.timestamp,
+                    "batch": effect.batch,
+                    "origin_module": ctx.module,
+                    "origin_id": ctx.entry_id,
+                    "origin_action": ctx.action,
+                })
+
+    @staticmethod
+    def _effect_payload(effect: FlowEffect) -> dict[str, Any]:
+        return {"name": effect.name, "module": effect.module,
+                "entry_id": effect.entry_id, "description": effect.description,
+                "timestamp": effect.timestamp, "batch": effect.batch}
+
+    # ------------------------------------------------------------------
+    # 读路径：动作轨迹查询（只读，绝不触发链路）
+    # ------------------------------------------------------------------
+
+    def trace(self, module: str, entry_id: int) -> dict[str, Any]:
+        """回传某个 entry 参与的已记录联动事件。
+
+        无论是链路的发起方（如特征存储详情）还是被联动方（如离线导出
+        工作台），看到的都是同一份动作轨迹、同一个动作编号。
+        """
+        with self._lock:
+            events = [
+                dict(event) for event in self._events
+                if (event["origin_module"] == module and event["origin_id"] == entry_id)
+                or (event["module"] == module and event["entry_id"] == entry_id)
+            ]
+        action_ids = sorted({str(event["action_id"]) for event in events})
+        return {
+            "module": module,
+            "entry_id": entry_id,
+            "action_ids": action_ids,
+            "effects": events,
+        }
+
+    # ------------------------------------------------------------------
+    # 回执登记：存储动作的第二次写入（回执可能迟到，登记幂等）
+    # ------------------------------------------------------------------
+
+    def register_receipt(
+        self, module: str, entry_id: int, action_id: str | None = None
+    ) -> tuple[dict[str, Any] | None, str]:
+        """登记存储回执：确认某次存储动作的导出批次已实际交付。"""
+        if module != "feature_store":
+            return None, "回执登记仅适用于特征存储配置"
+        fs = store.find("feature_store", entry_id)
+        if fs is None:
+            return None, f"存储配置 {entry_id} 不存在或已归档"
+
+        with self._lock:
+            accepted = [
+                event for event in self._events
+                if event["origin_module"] == "feature_store"
+                and event["origin_id"] == entry_id
+                and event["module"] == "offline_exp"
+                and event.get("batch")
+            ]
+            if not accepted:
+                return None, "该存储配置暂无已接受的导出批次，无法登记回执"
+            known_actions = {str(event["action_id"]) for event in accepted}
+            aid = action_id or str(accepted[-1]["action_id"])
+            if aid not in known_actions:
+                return None, f"动作 {aid} 不是该存储配置的联动动作，回执不予登记"
+
+            existing = self._receipts.get(aid)
+            if existing is not None:
+                return existing, "回执已登记，同一动作不重复登记"
+
+            batch = next(str(event["batch"]) for event in accepted
+                         if str(event["action_id"]) == aid)
+            receipt = {
+                "回执编号": self._next_receipt_no(),
+                "动作编号": aid,
+                "批次": batch,
+                "存储配置": str(fs.get("配置编号", "")),
+                "feature_store_id": entry_id,
+                "回执时间": datetime.datetime.now().isoformat(),
+            }
+            self._receipts[aid] = receipt
+            # 存储侧第二次写入：回执登记落账
+            fs["回执登记"] = f"{receipt['回执编号']}（{aid}）"
+            return receipt, "存储回执已登记"
+
+    # ------------------------------------------------------------------
+    # 管道对账表：接受凭据 × 存储回执 × 交接结算
+    # ------------------------------------------------------------------
+
+    def reconcile_exports(self) -> dict[str, Any]:
+        """离线导出管道对账表（只读）。
+
+        每个已接受批次对照存储回执核定交付状态：
+        - 已交付：回执核对一致，记作成功；
+        - 待核：回执暂缺，但接受凭据能独立查证（管道现状与凭据一致）；
+        - 缺口：回执与凭据均无法核定，保留可辨认的缺口。
+        """
+        with self._lock:
+            items: list[dict[str, Any]] = []
+            for erow in store.rows("offline_exp"):
+                credential = erow.get("接受凭据")
+                if not isinstance(credential, dict):
+                    continue
+                aid = str(credential.get("动作编号", ""))
+                batch = str(credential.get("批次", ""))
+                receipt = self._receipts.get(aid)
+                # 凭据独立查证：管道现状须与接受凭据一致
+                credential_ok = (
+                    erow.get("status") in ("导出中", "已完成")
+                    and str(erow.get("triggered_by", ""))
+                    == f"feature_store/{credential.get('存储配置', '')}"
+                )
+                if receipt is not None:
+                    check = "已交付"
+                elif credential_ok:
+                    check = "待核"
+                else:
+                    check = "缺口"
+                settlement = self._settlements.get(batch)
+                origin_id = self._origin_of(aid)
+                items.append({
+                    "批次": batch,
+                    "动作编号": aid,
+                    "管道编号": str(erow.get("管道编号", "")),
+                    "管道ID": int(erow.get("id", 0)),
+                    "存储配置": str(credential.get("存储配置", "")),
+                    "存储配置ID": origin_id,
+                    "接受时间": str(credential.get("接受时间", "")),
+                    "管道状态": str(erow.get("status", "")),
+                    "回执状态": "已登记" if receipt is not None else "暂缺",
+                    "回执编号": receipt.get("回执编号") if receipt else None,
+                    "回执时间": receipt.get("回执时间") if receipt else None,
+                    "交付核查": check,
+                    "结算状态": "已结算" if settlement and settlement.get("final") else "未结算",
+                    "结算结果": settlement.get("结算结果") if settlement else None,
+                    "结算时间": settlement.get("结算时间") if settlement else None,
+                })
+
+            # 历史缺口：已启用却没有任何联动轨迹的存储动作，无法核定，保留缺口
+            traced_origins = {
+                (event["origin_module"], event["origin_id"]) for event in self._events
+            }
+            gaps = [
+                {
+                    "存储配置": str(srow.get("配置编号", "")),
+                    "存储配置ID": int(srow.get("id", 0)),
+                    "状态": str(srow.get("status", "")),
+                    "缺口原因": "历史存储动作缺少联动轨迹与回执，无法核定实际交付",
+                }
+                for srow in store.rows("feature_store")
+                if srow.get("status") in ("已启用", "容量告警", "已迁移")
+                and ("feature_store", int(srow.get("id", 0))) not in traced_origins
+            ]
+            return {"items": items, "total": len(items), "gaps": gaps}
+
+    def _origin_of(self, action_id: str) -> int | None:
+        """查找动作编号对应的发起 entry id。"""
+        for event in self._events:
+            if str(event["action_id"]) == action_id:
+                return int(event["origin_id"])
+        return None
+
+    # ------------------------------------------------------------------
+    # 交接结算：值班员提交本班导出批次，接班人按结果接管
+    # ------------------------------------------------------------------
+
+    def settle_handover(
+        self,
+        *,
+        action_id: str | None = None,
+        batch: str | None = None,
+        operator: str | None = None,
+        shift: str | None = None,
+    ) -> tuple[dict[str, Any] | None, str]:
+        """提交导出批次的交接结算。
+
+        - 回执已登记（已交付）：接班人接管可用批次，最终结算同批只此一次；
+        - 回执暂缺但凭据可查证（待核）：接班人领核查待办，回执到达后再终算；
+        - 缺口：无法核定，不结算，保留缺口。
+        """
+        with self._lock:
+            table = self.reconcile_exports()
+            target = None
+            for row in table["items"]:
+                if batch and row["批次"] == batch:
+                    target = row
+                    break
+                if action_id and row["动作编号"] == action_id:
+                    target = row
+                    break
+            if target is None:
+                return None, "未找到对应的已接受导出批次，无法提交交接结算"
+
+            batch_no = str(target["批次"])
+            existing = self._settlements.get(batch_no)
+            if existing is not None and existing.get("final"):
+                return existing, "该批次已完成最终结算，同批只结算一次"
+
+            if target["交付核查"] == "缺口":
+                return None, "该批次回执与凭据均无法核定，保留缺口不结算"
+
+            now = datetime.datetime.now().isoformat()
+            history = list(existing.get("交接历史", [])) if existing else []
+            history.append({
+                "时间": now,
+                "值班员": operator or "值班员",
+                "班次": shift or "本班",
+            })
+
+            delivered = target["交付核查"] == "已交付"
+            record = {
+                "批次": batch_no,
+                "动作编号": str(target["动作编号"]),
+                "管道编号": str(target["管道编号"]),
+                "结算结果": "可用批次" if delivered else "核查待办",
+                "final": delivered,
+                "结算次数": 1 if delivered else 0,
+                "结算时间": now,
+                "值班员": operator or "值班员",
+                "班次": shift or "本班",
+                "交接历史": history,
+            }
+            self._settlements[batch_no] = record
+            if delivered:
+                return record, "交接结算完成：回执核对一致，接班人接管可用批次"
+            return record, "交接结算已提交：存储回执未到，接班人领核查待办"
 
 
 flow_engine = FlowEngine()
